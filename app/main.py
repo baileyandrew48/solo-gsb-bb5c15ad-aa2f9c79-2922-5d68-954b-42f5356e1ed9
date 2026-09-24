@@ -5,6 +5,7 @@
   GET    /sessions/{id}                 查询状态与缺失区间
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
   PUT    /sessions/{id}/chunks/repair   已收分片原位修复（区间必须与某已登记分片完全一致；可选 X-Chunk-SHA256）
+  POST   /sessions/{id}/chunks/audit    上传中会话的分片完整性诊断（按清单逐条核对磁盘分片，只读）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
@@ -746,6 +747,95 @@ async def put_chunk(
             )
 
     return await run_sync(_commit_chunk, session_id, start, end, str(tmp))
+
+
+# ---------------------------------------------------------------------------
+# 分片完整性诊断（POST /chunks/audit）
+#
+# 客户端提交 {start, end, sha256} 清单（1～32 条），服务端按起点顺序流式
+# 读取磁盘分片并逐条比对，返回每条的核对结论与实际摘要，供客户端圈定
+# chunks/repair 的目标区间。诊断是纯只读：不滑动 TTL、不改分片登记与
+# 已收字节；全过程持有会话锁，修复/完成/放弃都无法在核对中途插入，
+# 因此不会把替换中的瞬时状态误报为缺失或损坏。
+# 清单本身必须合法：每条区间都要与某已登记分片完全一致且不可重复，
+# 任一不符整批拒绝（一条都不核对）。
+# ---------------------------------------------------------------------------
+
+
+def _audit_chunks(session_id: str, entries: list[schemas.ChunkAuditEntry]) -> dict:
+    """持会话锁完成全部磁盘核对（只读，不触碰 TTL、登记与已收字节）。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] == "completed":
+            raise _http(409, "session already completed")
+
+        # 清单与已登记分片逐条精确对应；任一区间无精确匹配即整批拒绝。
+        conn = db.get_conn()
+        registered = {
+            (r["start_offset"], r["end_offset"])
+            for r in conn.execute(
+                "SELECT start_offset, end_offset FROM chunks WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        }
+        for entry in entries:
+            if (entry.start, entry.end) not in registered:
+                raise _http(
+                    404,
+                    "no registered chunk matches the range exactly",
+                    start=entry.start,
+                    end=entry.end,
+                )
+
+        # 按起点顺序流式核对磁盘分片；会话锁保证读到的是稳定状态。
+        results: list[dict] = []
+        for entry in sorted(entries, key=lambda e: (e.start, e.end)):
+            disk = storage.hash_part_file(session_id, entry.start, entry.end)
+            if disk is None:
+                results.append(
+                    {
+                        "start": entry.start,
+                        "end": entry.end,
+                        "status": "missing",
+                        "expected_sha256": entry.sha256,
+                        "actual_sha256": None,
+                        "size_on_disk": None,
+                    }
+                )
+                continue
+            size, actual = disk
+            if size != entry.end - entry.start:
+                status = "length_mismatch"
+            elif actual != entry.sha256:
+                status = "sha256_mismatch"
+            else:
+                status = "ok"
+            results.append(
+                {
+                    "start": entry.start,
+                    "end": entry.end,
+                    "status": status,
+                    "expected_sha256": entry.sha256,
+                    "actual_sha256": actual,
+                    "size_on_disk": size,
+                }
+            )
+
+    return {
+        "session_id": session_id,
+        "all_match": all(r["status"] == "ok" for r in results),
+        "results": results,
+    }
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/chunks/audit",
+    response_model=schemas.ChunkAuditResponse,
+    tags=["chunks"],
+)
+def audit_chunks(session_id: str, body: schemas.ChunkAuditRequest) -> dict:
+    """按客户端清单逐条核对磁盘分片，返回匹配/摘要不符/文件缺失/长度不符。"""
+    return _audit_chunks(session_id, body.chunks)
 
 
 # ---------------------------------------------------------------------------

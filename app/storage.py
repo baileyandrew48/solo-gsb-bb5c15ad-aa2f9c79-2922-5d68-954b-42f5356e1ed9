@@ -230,6 +230,29 @@ def assemble_artifact(
     return str(tmp_out), sha.hexdigest()
 
 
+def hash_part_file(session_id: str, start: int, end: int) -> tuple[int, str] | None:
+    """流式读取已登记分片文件，返回 (实际字节数, SHA-256)；文件缺失返回 None。
+
+    纯只读，供分片完整性诊断使用：字节数按实际读取统计（不经 stat），
+    读取与长度核对之间不存在竞态。调用方必须持有会话锁，保证读到的是
+    稳定状态（修复/完成/放弃都无法在中途插入）。
+    """
+    path = part_path(session_id, start, end)
+    sha = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(1024 * 1024)
+                if not block:
+                    break
+                sha.update(block)
+                size += len(block)
+    except FileNotFoundError:
+        return None
+    return size, sha.hexdigest()
+
+
 def atomic_publish(tmp_file: str, session_id: str) -> None:
     """把拼装好的临时文件原子替换为成品文件。"""
     os.replace(tmp_file, artifact_path(session_id))

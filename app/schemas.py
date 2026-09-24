@@ -108,6 +108,78 @@ class CopyChunkRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 分片完整性诊断（chunks/audit）
+# ---------------------------------------------------------------------------
+
+
+class ChunkAuditEntry(BaseModel):
+    """诊断清单中的一条：区间必须与某已登记分片完全一致。"""
+
+    start: int = Field(..., ge=0, description="起始偏移（含）")
+    end: int = Field(..., ge=0, description="结束偏移（不含），半开区间")
+    sha256: str = Field(
+        ...,
+        description="客户端持有的该区间内容摘要，64 位小写十六进制（可带 sha256: 前缀）",
+    )
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256(cls, value: str) -> str:
+        return normalize_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "ChunkAuditEntry":
+        if self.end <= self.start:
+            raise ValueError("invalid range: require start < end")
+        return self
+
+
+class ChunkAuditRequest(BaseModel):
+    """诊断清单：1～32 条且区间不可重复；与已登记分片的精确对应在服务端校验。"""
+
+    chunks: list[ChunkAuditEntry] = Field(
+        ..., min_length=1, max_length=32, description="待核对的分片清单，最多 32 条"
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique_ranges(self) -> "ChunkAuditRequest":
+        seen: set[tuple[int, int]] = set()
+        for entry in self.chunks:
+            key = (entry.start, entry.end)
+            if key in seen:
+                raise ValueError(
+                    f"duplicate chunk range {entry.start}-{entry.end} in audit manifest"
+                )
+            seen.add(key)
+        return self
+
+
+class ChunkAuditResult(BaseModel):
+    """单条清单的核对结论；actual_sha256/size_on_disk 在文件缺失时为 null。"""
+
+    start: int
+    end: int
+    status: str = Field(
+        ..., description="ok / sha256_mismatch / length_mismatch / missing"
+    )
+    expected_sha256: str = Field(..., description="清单中客户端声明的摘要")
+    actual_sha256: str | None = Field(
+        default=None, description="磁盘分片的实际 SHA-256；文件缺失时为 null"
+    )
+    size_on_disk: int | None = Field(
+        default=None, description="磁盘分片的实际字节数；文件缺失时为 null"
+    )
+
+
+class ChunkAuditResponse(BaseModel):
+    session_id: str
+    all_match: bool = Field(..., description="全部条目均为 ok 时为 true")
+    results: list[ChunkAuditResult] = Field(
+        ..., description="按起点升序逐条返回的核对结论"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 受控下载票据
 # ---------------------------------------------------------------------------
 
