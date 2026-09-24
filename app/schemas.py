@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -105,6 +106,74 @@ class CopyChunkRequest(BaseModel):
         if self.source_end <= self.source_start:
             raise ValueError("invalid source range: require source_start < source_end")
         return self
+
+
+# ---------------------------------------------------------------------------
+# 上传中分片完整性诊断（POST /chunks/audit）
+# ---------------------------------------------------------------------------
+
+
+class ChunkAuditItem(BaseModel):
+    """清单中的一条：与某已登记分片完全一致的半开区间 + 客户端期望摘要。"""
+
+    start: int = Field(..., ge=0, description="起始偏移（含）")
+    end: int = Field(..., ge=1, description="结束偏移（不含），半开区间 [start, end)")
+    sha256: str = Field(
+        ..., description="该分片内容的期望 SHA-256（64 位十六进制，可带 sha256: 前缀）"
+    )
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256(cls, value: str) -> str:
+        return normalize_sha256(value)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "ChunkAuditItem":
+        if self.end <= self.start:
+            raise ValueError("invalid range: require start < end")
+        return self
+
+
+class ChunkAuditRequest(BaseModel):
+    """分片完整性诊断请求：1～32 条清单，区间逐条精确对应已登记分片且不可重复。"""
+
+    chunks: list[ChunkAuditItem] = Field(
+        ...,
+        min_length=1,
+        max_length=32,
+        description="待核对清单，最多 32 条；服务端按起点顺序核对",
+    )
+
+
+class ChunkAuditResult(BaseModel):
+    """单条核对结果。
+
+    status：
+      ok               磁盘分片存在、长度与区间一致且摘要匹配；
+      digest_mismatch  长度一致但 SHA-256 不符；
+      missing          已登记但磁盘分片文件缺失；
+      length_mismatch 磁盘文件长度与 end-start 不符。
+    非 ok 时 actual_sha256 给出磁盘实际内容摘要（文件缺失时为 null），
+    供客户端确定 repair 的目标区间。
+    """
+
+    start: int
+    end: int
+    expected_sha256: str
+    status: Literal["ok", "digest_mismatch", "missing", "length_mismatch"]
+    actual_size: int | None = Field(
+        ..., description="磁盘文件实际字节数；文件缺失时为 null"
+    )
+    actual_sha256: str | None = Field(
+        ..., description="磁盘实际内容的 SHA-256；文件缺失时为 null"
+    )
+
+
+class ChunkAuditResponse(BaseModel):
+    session_id: str
+    results: list[ChunkAuditResult] = Field(
+        ..., description="逐条核对结果，按 start 升序排列"
+    )
 
 
 # ---------------------------------------------------------------------------

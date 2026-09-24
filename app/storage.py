@@ -235,6 +235,24 @@ def atomic_publish(tmp_file: str, session_id: str) -> None:
     os.replace(tmp_file, artifact_path(session_id))
 
 
+def sha256_file(path: Path) -> tuple[int, str]:
+    """流式计算磁盘文件的 (字节数, SHA-256)，1 MiB 一块，不整文件进内存。
+
+    供分片完整性诊断使用：弱网客户端登记的分片可能很大，
+    诊断必须与流式接收/拼装一样保持常量级内存占用。
+    """
+    sha = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        while True:
+            block = fh.read(1024 * 1024)
+            if not block:
+                break
+            size += len(block)
+            sha.update(block)
+    return size, sha.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # 跨会话复制：从已完成会话的成品中切出一段，流式写入临时文件
 # ---------------------------------------------------------------------------

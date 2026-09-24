@@ -5,6 +5,7 @@
   GET    /sessions/{id}                 查询状态与缺失区间
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
   PUT    /sessions/{id}/chunks/repair   已收分片原位修复（区间必须与某已登记分片完全一致；可选 X-Chunk-SHA256）
+  POST   /sessions/{id}/chunks/audit     上传中分片完整性诊断（最多 32 条清单，逐条核对磁盘分片的存在/长度/摘要）
   POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
@@ -639,6 +640,128 @@ async def repair_chunk(
             )
 
     return await run_sync(_commit_chunk_repair, session_id, start, end, str(tmp))
+
+
+# ---------------------------------------------------------------------------
+# 上传中分片完整性诊断（POST /chunks/audit）
+#
+# complete 返回 422 后，客户端通常只能在本地按相同偏移逐片比对摘要来猜测
+# 哪片损坏。本接口让客户端把“已登记分片 + 期望摘要”的清单（最多 32 条）
+# 交给服务端，由服务端按起点顺序流式核对磁盘分片，逐条给出：
+#   ok               存在、长度一致、摘要匹配；
+#   digest_mismatch  长度一致但摘要不符（给出实际摘要）；
+#   missing          文件缺失（actual_size/actual_sha256 均为 null）；
+#   length_mismatch  文件长度不符（给出实际长度与实际摘要）。
+# 客户端据此只对非 ok 的区间调用 repair，无需放弃会话或重传全部内容。
+#
+# 安全语义：
+#   - 清单中的每个区间都必须与一条已登记分片**逐条精确对应**，且清单内
+#     不可重复；任一非法都整批拒绝（400），不返回任何逐条结果。
+#   - 全过程持有会话锁，与 repair / complete / abort / 懒过期完全互斥，
+#     不会在分片被替换或删除的半途读到“半替换”状态而误报。
+#   - 纯只读：不滑动 TTL（不更新 last_access_at / expires_at）、不改 chunks
+#     登记、不改 bytes_received，不写任何临时文件。
+#   - 会话不存在 → 404；已过期/已放弃 → 410；已完成 → 409
+#     （完成后分片目录已删除，诊断无意义）。
+# ---------------------------------------------------------------------------
+
+
+def _audit_chunks(session_id: str, body: schemas.ChunkAuditRequest) -> dict:
+    """持会话锁核对清单：清单合法性整批校验，随后按起点顺序流式核对磁盘。"""
+    with session_locks.get(session_id):
+        row = _load_session(session_id)
+        if row["status"] == "completed":
+            raise _http(409, "session already completed; nothing to audit")
+
+        # ---- 清单合法性：任何一条不过，整批拒绝，不触碰磁盘分片。 ----
+        seen: set[tuple[int, int]] = set()
+        duplicates: list[dict[str, int]] = []
+        requested: list[tuple[int, int]] = []
+        for item in body.chunks:
+            key = (item.start, item.end)
+            if key in seen:
+                duplicates.append({"start": item.start, "end": item.end})
+            seen.add(key)
+            requested.append(key)
+        if duplicates:
+            raise _http(
+                400,
+                "audit manifest contains duplicate ranges",
+                duplicates=duplicates,
+            )
+
+        registered = set(_existing_intervals(db.get_conn(), session_id))
+        unregistered = [
+            {"start": s, "end": e} for s, e in requested if (s, e) not in registered
+        ]
+        if unregistered:
+            raise _http(
+                400,
+                "audit manifest ranges must exactly match registered chunks",
+                unregistered=unregistered,
+            )
+
+        # ---- 逐条核对：按起点升序流式读取，常量内存计算长度与摘要。 ----
+        results: list[dict] = []
+        for item in sorted(body.chunks, key=lambda c: c.start):
+            part = storage.part_path(session_id, item.start, item.end)
+            expected_length = item.end - item.start
+            if not part.is_file():
+                results.append(
+                    {
+                        "start": item.start,
+                        "end": item.end,
+                        "expected_sha256": item.sha256,
+                        "status": "missing",
+                        "actual_size": None,
+                        "actual_sha256": None,
+                    }
+                )
+                continue
+            try:
+                actual_size, actual_digest = storage.sha256_file(part)
+            except (OSError, FileNotFoundError):
+                # 持锁期间分片不会被本进程删除；文件在 stat 与打开之间消失
+                # 只可能来自外部干预，按缺失报告，不让诊断整体失败。
+                results.append(
+                    {
+                        "start": item.start,
+                        "end": item.end,
+                        "expected_sha256": item.sha256,
+                        "status": "missing",
+                        "actual_size": None,
+                        "actual_sha256": None,
+                    }
+                )
+                continue
+            if actual_size != expected_length:
+                status = "length_mismatch"
+            elif actual_digest != item.sha256:
+                status = "digest_mismatch"
+            else:
+                status = "ok"
+            results.append(
+                {
+                    "start": item.start,
+                    "end": item.end,
+                    "expected_sha256": item.sha256,
+                    "status": status,
+                    "actual_size": actual_size,
+                    "actual_sha256": actual_digest,
+                }
+            )
+
+    return {"session_id": session_id, "results": results}
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/chunks/audit",
+    response_model=schemas.ChunkAuditResponse,
+    tags=["chunks"],
+)
+def audit_chunks(session_id: str, body: schemas.ChunkAuditRequest) -> dict:
+    """上传中会话的分片完整性诊断：逐条核对磁盘分片的存在、长度与 SHA-256。"""
+    return _audit_chunks(session_id, body)
 
 
 @app.put(
